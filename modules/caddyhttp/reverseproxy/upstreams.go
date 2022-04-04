@@ -342,6 +342,126 @@ func (au AUpstreams) GetUpstreams(r *http.Request) ([]*Upstream, error) {
 	return upstreams, nil
 }
 
+func (au AUpstreams) GetUpstreamsNoTimeSince(r *http.Request) ([]*Upstream, error) {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	auStr := repl.ReplaceAll(au.String(), "")
+
+	// first, use a cheap read-lock to return a cached result quickly
+	aAaaaMu2.RLock()
+	cached := aAaaa2[auStr]
+	aAaaaMu2.RUnlock()
+	if cached.isFresh() {
+		return cached.upstreams, nil
+	}
+
+	// otherwise, obtain a write-lock to update the cached value
+	aAaaaMu2.Lock()
+	defer aAaaaMu2.Unlock()
+
+	// check to see if it's still stale, since we're now in a different
+	// lock from when we first checked freshness; another goroutine might
+	// have refreshed it in the meantime before we re-obtained our lock
+	cached = aAaaa2[auStr]
+	if cached.isFresh() {
+		return cached.upstreams, nil
+	}
+
+	name := repl.ReplaceAll(au.Name, "")
+	port := repl.ReplaceAll(au.Port, "")
+
+	ips, err := au.resolver.LookupIPAddr(r.Context(), name)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreams := make([]*Upstream, len(ips))
+	for i, ip := range ips {
+		upstreams[i] = &Upstream{
+			Dial: net.JoinHostPort(ip.String(), port),
+		}
+	}
+
+	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
+	if cached.freshness == 0 && len(srvs) >= 100 {
+		for randomKey := range aAaaa {
+			delete(aAaaa, randomKey)
+			break
+		}
+	}
+
+	now := time.Now()
+	aAaaa2[auStr] = aaLookup{
+		expiration: now.Add(time.Duration(au.Refresh)).UnixNano(),
+		freshness:  now.UnixNano(),
+		upstreams:  upstreams,
+	}
+
+	return upstreams, nil
+}
+
+func (au AUpstreams) GetUpstreamsSyncMapNoTimeSince(r *http.Request) ([]*Upstream, error) {
+	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+	auStr := repl.ReplaceAll(au.String(), "")
+
+	// first, use a cheap load to return a cached result quickly
+	cached, ok := aAaaaMap.Load(auStr)
+	if ok && cached.(aaLookup).isFresh() {
+		return cached.(aaLookup).upstreams, nil
+	}
+
+	// otherwise, obtain a lock to update the cached value
+	aAaaaMapMu.Lock()
+	defer aAaaaMapMu.Unlock()
+
+	// check to see if it's still stale, since we're now in a different
+	// lock from when we first checked freshness; another goroutine might
+	// have refreshed it in the meantime before we re-obtained our lock
+	cached, ok = aAaaaMap.Load(auStr)
+	if ok && cached.(aaLookup).isFresh() {
+		return cached.(aaLookup).upstreams, nil
+	}
+
+	name := repl.ReplaceAll(au.Name, "")
+	port := repl.ReplaceAll(au.Port, "")
+
+	ips, err := au.resolver.LookupIPAddr(r.Context(), name)
+	if err != nil {
+		return nil, err
+	}
+
+	upstreams := make([]*Upstream, len(ips))
+	for i, ip := range ips {
+		upstreams[i] = &Upstream{
+			Dial: net.JoinHostPort(ip.String(), port),
+		}
+	}
+
+	// before adding a new one to the cache (as opposed to replacing stale one), make room if cache is full
+	if cached != nil && cached.(aaLookup).freshness == 0 {
+		var size int
+		var randomKey interface{}
+		aAaaaMap.Range(func(key, value interface{}) bool {
+			if size == 0 {
+				randomKey = key
+			}
+			size++
+			return true
+		})
+		if size >= 100 {
+			aAaaaMap.Delete(randomKey)
+		}
+	}
+
+	now := time.Now()
+	aAaaaMap.Store(auStr, aaLookup{
+		expiration: now.Add(time.Duration(au.Refresh)).UnixNano(),
+		freshness:  now.UnixNano(),
+		upstreams:  upstreams,
+	})
+
+	return upstreams, nil
+}
+
 func (au AUpstreams) String() string { return net.JoinHostPort(au.Name, au.Port) }
 
 type aLookup struct {
@@ -352,6 +472,16 @@ type aLookup struct {
 
 func (al aLookup) isFresh() bool {
 	return time.Since(al.freshness) < time.Duration(al.aUpstreams.Refresh)
+}
+
+type aaLookup struct {
+	expiration int64
+	freshness  int64
+	upstreams  []*Upstream
+}
+
+func (al aaLookup) isFresh() bool {
+	return al.freshness < al.expiration
 }
 
 // UpstreamResolver holds the set of addresses of DNS resolvers of
@@ -385,6 +515,12 @@ func (u *UpstreamResolver) ParseAddresses() error {
 var (
 	aAaaa   = make(map[string]aLookup)
 	aAaaaMu sync.RWMutex
+
+	aAaaa2   = make(map[string]aaLookup)
+	aAaaaMu2 sync.RWMutex
+
+	aAaaaMap   sync.Map
+	aAaaaMapMu sync.Mutex
 )
 
 // Interface guards
